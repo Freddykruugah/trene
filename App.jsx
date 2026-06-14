@@ -218,20 +218,35 @@ function noToEn(name = "") {
 }
 function enName(ex) { return (ex.en && ex.en.trim()) || noToEn(ex.name) || ex.name; }
 
-// enkel cache (sesjon + localStorage) for å spare API-forespørsler
+// cache for å spare API-forespørsler.
+// VIKTIG: bom (null) lagres bare for økten (i minnet), aldri varig — slik kan
+// en midlertidig feil aldri "fryse" en øvelse til å aldri vise GIF.
+const GIFCACHE_KEY = "pt_gifcache_v2";
 const gifCache = {};
-try { Object.assign(gifCache, JSON.parse(localStorage.getItem("pt_gifcache_v1") || "{}")); } catch (e) {}
+try { Object.assign(gifCache, JSON.parse(localStorage.getItem(GIFCACHE_KEY) || "{}")); } catch (e) {}
+function persistGifCache() {
+  try {
+    const hits = {};
+    for (const k in gifCache) if (gifCache[k]) hits[k] = gifCache[k]; // bare treff
+    localStorage.setItem(GIFCACHE_KEY, JSON.stringify(hits));
+  } catch (e) {}
+}
 function cacheGif(key, val) {
   gifCache[key] = val;
-  try { localStorage.setItem("pt_gifcache_v1", JSON.stringify(gifCache)); } catch (e) {}
+  if (val) persistGifCache(); // lagre bare treff varig
+}
+function clearGifCache() {
+  for (const k in gifCache) delete gifCache[k];
+  try { localStorage.removeItem(GIFCACHE_KEY); localStorage.removeItem("pt_gifcache_v1"); } catch (e) {}
 }
 
 async function fetchGif(ex) {
   const key = enName(ex).toLowerCase();
-  if (key in gifCache) return gifCache[key]; // null = ingen treff, string = url
+  if (gifCache[key]) return gifCache[key];           // har treff
+  if (key in gifCache && gifCache[key] === null) return null; // bom denne økten
   try {
     const res = await fetch("/api/exercise?name=" + encodeURIComponent(key));
-    if (!res.ok) { cacheGif(key, null); return null; }
+    if (!res.ok) return null; // ikke cache feil
     const data = await res.json();
     const url = data && data.ok && data.gif ? data.gif : null;
     cacheGif(key, url);
@@ -1016,6 +1031,7 @@ export default function App() {
 
   const reset = () => {
     try { localStorage.removeItem("pt_state_v1"); } catch (e) {}
+    clearGifCache();
     setProfile(null); setProgram(null); setHistory([]); setExerciseLog({});
     setActive(null); setFinished(null); setTab("home"); setScreen("onboarding");
   };
