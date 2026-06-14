@@ -199,23 +199,65 @@ async function callClaude(messages, system, maxTokens = 1400) {
   return data.text || "";
 }
 
+/* ── Øvelses-GIF via serverless-proxy (/api/exercise) ──────────── */
+// norsk → engelsk reserve hvis AI ikke ga "en"-felt (f.eks. gamle program)
+function noToEn(name = "") {
+  const n = name.toLowerCase();
+  const map = [
+    [["knebøy", "squat"], "squat"], [["markløft", "deadlift", "rdl"], "deadlift"],
+    [["benkpress", "benk"], "bench press"], [["push", "armhev"], "push up"],
+    [["utfall", "lunge"], "lunge"], [["roing", "row"], "row"],
+    [["skulderpress", "military"], "shoulder press"], [["bicep", "curl"], "bicep curl"],
+    [["planke", "plank"], "plank"], [["nedtrekk", "pulldown"], "lat pulldown"],
+    [["pull", "kroppshev"], "pull up"], [["dips"], "dips"], [["leg press", "beinpress"], "leg press"],
+    [["triceps"], "triceps extension"], [["crunch", "situp", "sit-up"], "crunch"],
+    [["hofteløft", "hip thrust"], "hip thrust"], [["flies", "flyes"], "dumbbell fly"],
+  ];
+  const hit = map.find(([k]) => k.some((kw) => n.includes(kw)));
+  return hit ? hit[1] : "";
+}
+function enName(ex) { return (ex.en && ex.en.trim()) || noToEn(ex.name) || ex.name; }
+
+// enkel cache (sesjon + localStorage) for å spare API-forespørsler
+const gifCache = {};
+try { Object.assign(gifCache, JSON.parse(localStorage.getItem("pt_gifcache_v1") || "{}")); } catch (e) {}
+function cacheGif(key, val) {
+  gifCache[key] = val;
+  try { localStorage.setItem("pt_gifcache_v1", JSON.stringify(gifCache)); } catch (e) {}
+}
+
+async function fetchGif(ex) {
+  const key = enName(ex).toLowerCase();
+  if (key in gifCache) return gifCache[key]; // null = ingen treff, string = url
+  try {
+    const res = await fetch("/api/exercise?name=" + encodeURIComponent(key));
+    if (!res.ok) { cacheGif(key, null); return null; }
+    const data = await res.json();
+    const url = data && data.ok && data.gif ? data.gif : null;
+    cacheGif(key, url);
+    return url;
+  } catch (e) {
+    return null; // ikke cache nettverksfeil — kan prøves igjen senere
+  }
+}
+
 function fallbackProgram(p) {
-  const ex = (name, sets, reps, rest, muscle) => ({ name, sets, reps, rest, muscle, notes: "" });
+  const ex = (name, en, sets, reps, rest, muscle) => ({ name, en, sets, reps, rest, muscle, notes: "" });
   return {
     name: "Helkroppsprogram",
     summary: "Et balansert helkroppsprogram som starter rolig. (Lokal mal — AI var ikke tilgjengelig.)",
     days: [
       { day: "Økt A — Helkropp", focus: "Helkropp", exercises: [
-        ex("Knebøy", 3, "8–10", 90, "Bein"),
-        ex("Push-ups", 3, "8–12", 60, "Bryst"),
-        ex("Roing med manualer", 3, "10–12", 75, "Rygg"),
-        ex("Planke", 3, "30 sek", 45, "Kjerne"),
+        ex("Knebøy", "squat", 3, "8–10", 90, "Bein"),
+        ex("Push-ups", "push up", 3, "8–12", 60, "Bryst"),
+        ex("Roing med manualer", "dumbbell row", 3, "10–12", 75, "Rygg"),
+        ex("Planke", "plank", 3, "30 sek", 45, "Kjerne"),
       ]},
       { day: "Økt B — Helkropp", focus: "Helkropp", exercises: [
-        ex("Utfall", 3, "10/side", 75, "Bein"),
-        ex("Skulderpress", 3, "8–12", 75, "Skulder"),
-        ex("Markløft (RDL)", 3, "8–10", 90, "Bakside"),
-        ex("Bicep curl", 3, "10–12", 60, "Arm"),
+        ex("Utfall", "lunge", 3, "10/side", 75, "Bein"),
+        ex("Skulderpress", "shoulder press", 3, "8–12", 75, "Skulder"),
+        ex("Markløft (RDL)", "romanian deadlift", 3, "8–10", 90, "Bakside"),
+        ex("Bicep curl", "bicep curl", 3, "10–12", 60, "Arm"),
       ]},
     ],
   };
@@ -225,7 +267,8 @@ async function generateProgram(profile) {
   const system =
     "Du er en erfaren norsk personlig trener. Lag et konkret, trygt og progressivt ukentlig treningsprogram. " +
     "Svar KUN med gyldig JSON, ingen markdown, ingen forklaring utenfor JSON. Bruk norske øvelsesnavn. " +
-    'Format: {"name": string, "summary": string (1–2 setninger), "days": [{"day": string, "focus": string, "exercises": [{"name": string, "sets": number, "reps": string, "rest": number (sekunder), "muscle": string, "notes": string}]}]}';
+    'For hver øvelse skal "en" være det vanlige ENGELSKE navnet på øvelsen (for videooppslag), f.eks. "squat", "barbell bench press", "romanian deadlift", "push up". ' +
+    'Format: {"name": string, "summary": string (1–2 setninger), "days": [{"day": string, "focus": string, "exercises": [{"name": string, "en": string, "sets": number, "reps": string, "rest": number (sekunder), "muscle": string, "notes": string}]}]}';
   const u =
     `Mål: ${profile.goalLabel}. Nivå: ${profile.levelLabel}. Utstyr: ${profile.equipLabel}. ` +
     `Dager per uke: ${profile.days}. Tid per økt: ${profile.time} min. ` +
@@ -494,9 +537,20 @@ function Workout({ day, dayIndex, onFinish, onQuit, exerciseLog = {} }) {
   const [resting, setResting] = useState(false);
   const [motiv, setMotiv] = useState("");
   const [showInfo, setShowInfo] = useState(false);
+  const [gif, setGif] = useState(null); // url | null
+  const [gifLoading, setGifLoading] = useState(false);
 
   const ex = day.exercises[exIdx];
   const info = exInfo(ex.name);
+
+  // hent øvelses-GIF når vi bytter øvelse (faller stille tilbake på SVG)
+  useEffect(() => {
+    let alive = true;
+    setGif(null); setGifLoading(true);
+    fetchGif(ex).then((url) => { if (alive) { setGif(url); setGifLoading(false); } });
+    return () => { alive = false; };
+  }, [exIdx]);
+
   const last = lastEntry(exerciseLog, ex.name);
   const suggestion = suggestTarget(ex, last);
   const prevBest = bestE1RM(exerciseLog, ex.name);
@@ -557,8 +611,19 @@ function Workout({ day, dayIndex, onFinish, onQuit, exerciseLog = {} }) {
       <div style={{ flex: 1, overflowY: "auto", padding: "18px 18px 120px" }}>
         <div className="fade" key={exIdx}>
           <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}>
-            <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 18, padding: 8 }}>
-              <Demo type={info.demo} size={120} />
+            <div style={{ background: C.surface, border: `1px solid ${C.line}`, borderRadius: 18, padding: 8, position: "relative", minWidth: 136, minHeight: 136, display: "grid", placeItems: "center" }}>
+              {gif ? (
+                <img src={gif} alt={ex.name} loading="eager"
+                  onError={() => setGif(null)}
+                  style={{ width: 150, height: 150, objectFit: "contain", borderRadius: 12, background: "#fff" }} />
+              ) : (
+                <Demo type={info.demo} size={120} />
+              )}
+              {gifLoading && !gif && (
+                <div style={{ position: "absolute", bottom: 6, right: 6 }}>
+                  <Loader2 size={14} className="spin" color={C.muted} />
+                </div>
+              )}
             </div>
           </div>
           <div style={{ textAlign: "center", marginBottom: 4 }}>
