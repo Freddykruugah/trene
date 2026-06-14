@@ -1,0 +1,5 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; background: #14120E; }
+body { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; overscroll-behavior: none; }
+#root { height: 100%; }
+input, textarea, button { font-family: inherit; }
